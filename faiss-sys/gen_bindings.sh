@@ -5,8 +5,8 @@ if ! which bindgen > /dev/null; then
     exit 1
 fi
 
-repo_url=https://github.com/Enet4/faiss.git
-repo_rev=c_api_head
+repo_url=https://github.com/facebookresearch/faiss.git
+repo_rev=1.7.1
 cuda_root=/opt/cuda
 
 git clone $repo_url faiss --branch $repo_rev --depth 1
