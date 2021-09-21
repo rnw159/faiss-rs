@@ -5,8 +5,8 @@ use super::*;
 use crate::error::Result;
 use crate::faiss_try;
 use std::mem;
-use std::ptr;
 use std::os::raw::c_int;
+use std::ptr;
 
 /// Alias for the native implementation of a flat index.
 pub type IVFFlatIndex = IVFFlatIndexImpl;
@@ -31,16 +31,6 @@ impl Drop for IVFFlatIndexImpl {
 }
 
 impl IVFFlatIndexImpl {
-    /// Create a new IVF flat index.
-    pub fn new_by_ref(
-        quantizer: &flat::FlatIndex,
-        d: u32,
-        nlist: u32,
-        metric: MetricType,
-    ) -> Result<Self> {
-        IVFFlatIndexImpl::new_helper(quantizer, d, nlist, metric, false)
-    }
-
     fn new_helper(
         quantizer: &flat::FlatIndex,
         d: u32,
@@ -73,19 +63,9 @@ impl IVFFlatIndexImpl {
     }
 
     /// Create a new IVF flat index with L2 as the metric type.
-    pub fn new_l2_by_ref(quantizer: &flat::FlatIndex, d: u32, nlist: u32) -> Result<Self> {
-        IVFFlatIndexImpl::new_by_ref(quantizer, d, nlist, MetricType::L2)
-    }
-
-    /// Create a new IVF flat index with L2 as the metric type.
     // The index owns the quantizer.
     pub fn new_l2(quantizer: flat::FlatIndex, d: u32, nlist: u32) -> Result<Self> {
         IVFFlatIndexImpl::new(quantizer, d, nlist, MetricType::L2)
-    }
-
-    /// Create a new IVF flat index with IP (inner product) as the metric type.
-    pub fn new_ip_by_ref(quantizer: &flat::FlatIndex, d: u32, nlist: u32) -> Result<Self> {
-        IVFFlatIndexImpl::new_by_ref(quantizer, d, nlist, MetricType::InnerProduct)
     }
 
     /// Create a new IVF flat index with IP (inner product) as the metric type.
@@ -125,7 +105,7 @@ impl IVFFlatIndexImpl {
  * = 1: just pass on the training set to the train() of the quantizer
  * = 2: kmeans training on a flat index + add the centroids to the quantizer
  */
- #[derive(Debug, Copy, Clone, Eq, Hash, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, Hash, PartialEq)]
 pub enum TrainType {
     /// use the quantizer as index in a kmeans training
     QuantizerAsIndex,
@@ -164,53 +144,7 @@ impl_native_index!(IVFFlatIndex);
 
 impl_native_index_clone!(IVFFlatIndex);
 
-impl ConcurrentIndex for IVFFlatIndexImpl {
-    fn assign(&self, query: &[f32], k: usize) -> Result<AssignSearchResult> {
-        unsafe {
-            let nq = query.len() / self.d() as usize;
-            let mut out_labels = vec![Idx::none(); k * nq];
-            faiss_try(faiss_Index_assign(
-                self.inner,
-                nq as idx_t,
-                query.as_ptr(),
-                out_labels.as_mut_ptr() as *mut _,
-                k as i64,
-            ))?;
-            Ok(AssignSearchResult { labels: out_labels })
-        }
-    }
-    fn search(&self, query: &[f32], k: usize) -> Result<SearchResult> {
-        unsafe {
-            let nq = query.len() / self.d() as usize;
-            let mut distances = vec![0_f32; k * nq];
-            let mut labels = vec![Idx::none(); k * nq];
-            faiss_try(faiss_Index_search(
-                self.inner,
-                nq as idx_t,
-                query.as_ptr(),
-                k as idx_t,
-                distances.as_mut_ptr(),
-                labels.as_mut_ptr() as *mut _,
-            ))?;
-            Ok(SearchResult { distances, labels })
-        }
-    }
-    fn range_search(&self, query: &[f32], radius: f32) -> Result<RangeSearchResult> {
-        unsafe {
-            let nq = (query.len() / self.d() as usize) as idx_t;
-            let mut p_res: *mut FaissRangeSearchResult = ptr::null_mut();
-            faiss_try(faiss_RangeSearchResult_new(&mut p_res, nq))?;
-            faiss_try(faiss_Index_range_search(
-                self.inner,
-                nq,
-                query.as_ptr(),
-                radius,
-                p_res,
-            ))?;
-            Ok(RangeSearchResult { inner: p_res })
-        }
-    }
-}
+impl_concurrent_index!(IVFFlatIndexImpl);
 
 impl IndexImpl {
     /// Attempt a dynamic cast of an index to the IVF flat index type.
@@ -232,7 +166,7 @@ mod tests {
 
     use super::IVFFlatIndexImpl;
     use crate::index::flat::FlatIndexImpl;
-    use crate::index::{index_factory, ConcurrentIndex, Idx, Index};
+    use crate::index::{index_factory, ConcurrentIndex, Idx, Index, UpcastIndex};
     use crate::MetricType;
 
     const D: u32 = 8;
@@ -241,7 +175,7 @@ mod tests {
     // #[ignore]
     fn index_search() {
         let q = FlatIndexImpl::new_l2(D).unwrap();
-        let mut index = IVFFlatIndexImpl::new_l2_by_ref(&q, D, 1).unwrap();
+        let mut index = IVFFlatIndexImpl::new_l2(q, D, 1).unwrap();
         assert_eq!(index.d(), D);
         assert_eq!(index.ntotal(), 0);
         let some_data = &[
@@ -309,7 +243,7 @@ mod tests {
     #[test]
     fn index_assign() {
         let q = FlatIndexImpl::new_l2(D).unwrap();
-        let mut index = IVFFlatIndexImpl::new_l2_by_ref(&q, D, 1).unwrap();
+        let mut index = IVFFlatIndexImpl::new_l2(q, D, 1).unwrap();
         assert_eq!(index.d(), D);
         assert_eq!(index.ntotal(), 0);
         let some_data = &[
@@ -351,5 +285,16 @@ mod tests {
         let index: IVFFlatIndexImpl = index.into_ivf_flat().unwrap();
         assert_eq!(index.is_trained(), true);
         assert_eq!(index.ntotal(), 5);
+    }
+
+    #[test]
+    fn index_upcast() {
+        let q = FlatIndexImpl::new_l2(D).unwrap();
+        let index = IVFFlatIndexImpl::new_l2(q, D, 1).unwrap();
+        assert_eq!(index.d(), D);
+        assert_eq!(index.ntotal(), 0);
+
+        let index_impl = index.upcast();
+        assert_eq!(index_impl.d(), D);
     }
 }

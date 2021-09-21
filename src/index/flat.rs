@@ -126,65 +126,45 @@ impl FromInnerPtr for FlatIndexImpl {
     }
 }
 
-impl_native_index!(FlatIndex);
-
-impl_native_index_clone!(FlatIndex);
-
-impl ConcurrentIndex for FlatIndexImpl {
-    fn assign(&self, query: &[f32], k: usize) -> Result<AssignSearchResult> {
+impl TryFromInnerPtr for FlatIndexImpl {
+    fn try_from_inner_ptr(inner_ptr: *mut FaissIndex) -> Result<Self>
+    where
+        Self: Sized,
+    {
         unsafe {
-            let nq = query.len() / self.d() as usize;
-            let mut out_labels = vec![Idx::none(); k * nq];
-            faiss_try(faiss_Index_assign(
-                self.inner,
-                nq as idx_t,
-                query.as_ptr(),
-                out_labels.as_mut_ptr() as *mut _,
-                k as i64,
-            ))?;
-            Ok(AssignSearchResult { labels: out_labels })
-        }
-    }
-    fn search(&self, query: &[f32], k: usize) -> Result<SearchResult> {
-        unsafe {
-            let nq = query.len() / self.d() as usize;
-            let mut distances = vec![0_f32; k * nq];
-            let mut labels = vec![Idx::none(); k * nq];
-            faiss_try(faiss_Index_search(
-                self.inner,
-                nq as idx_t,
-                query.as_ptr(),
-                k as idx_t,
-                distances.as_mut_ptr(),
-                labels.as_mut_ptr() as *mut _,
-            ))?;
-            Ok(SearchResult { distances, labels })
-        }
-    }
-    fn range_search(&self, query: &[f32], radius: f32) -> Result<RangeSearchResult> {
-        unsafe {
-            let nq = (query.len() / self.d() as usize) as idx_t;
-            let mut p_res: *mut FaissRangeSearchResult = ptr::null_mut();
-            faiss_try(faiss_RangeSearchResult_new(&mut p_res, nq))?;
-            faiss_try(faiss_Index_range_search(
-                self.inner,
-                nq,
-                query.as_ptr(),
-                radius,
-                p_res,
-            ))?;
-            Ok(RangeSearchResult { inner: p_res })
+            let new_inner = faiss_IndexFlat_cast(inner_ptr);
+            if new_inner.is_null() {
+                Err(Error::BadCast)
+            } else {
+                Ok(FlatIndexImpl { inner: new_inner })
+            }
         }
     }
 }
 
+impl_native_index!(FlatIndex);
+
+impl_native_index_clone!(FlatIndex);
+
+impl_concurrent_index!(FlatIndexImpl);
+
 #[cfg(test)]
 mod tests {
     use super::FlatIndexImpl;
-    use crate::index::{index_factory, ConcurrentIndex, FromInnerPtr, Idx, Index, NativeIndex};
+    use crate::index::{
+        index_factory, ConcurrentIndex, FromInnerPtr, Idx, Index, NativeIndex, UpcastIndex,
+    };
     use crate::metric::MetricType;
 
     const D: u32 = 8;
+
+    #[test]
+    fn flat_index_from_upcast() {
+        let index = FlatIndexImpl::new_l2(D).unwrap();
+
+        let index_impl = index.upcast();
+        assert_eq!(index_impl.d(), D);
+    }
 
     #[test]
     fn flat_index_from_cast() {
@@ -203,6 +183,35 @@ mod tests {
         assert_eq!(index.ntotal(), 5);
         let xb = index.xb();
         assert_eq!(xb.len(), 8 * 5);
+    }
+
+    #[test]
+    fn flat_index_boxed() {
+        let mut index = FlatIndexImpl::new_l2(8).unwrap();
+        assert_eq!(index.is_trained(), true); // Flat index does not need training
+        let some_data = &[
+            7.5_f32, -7.5, 7.5, -7.5, 7.5, 7.5, 7.5, 7.5, -1., 1., 1., 1., 1., 1., 1., -1., 0., 0.,
+            0., 1., 1., 0., 0., -1., 100., 100., 100., 100., -100., 100., 100., 100., 120., 100.,
+            100., 105., -100., 100., 100., 105.,
+        ];
+        index.add(some_data).unwrap();
+        assert_eq!(index.ntotal(), 5);
+
+        let boxed = Box::new(index);
+        assert_eq!(boxed.is_trained(), true);
+        assert_eq!(boxed.ntotal(), 5);
+        let xb = boxed.xb();
+        assert_eq!(xb.len(), 8 * 5);
+    }
+
+    #[test]
+    fn index_verbose() {
+        let mut index = FlatIndexImpl::new_l2(D).unwrap();
+        assert_eq!(index.is_trained(), true); // Flat index does not need training
+        index.set_verbose(true);
+        assert_eq!(index.verbose(), true);
+        index.set_verbose(false);
+        assert_eq!(index.verbose(), false);
     }
 
     #[test]

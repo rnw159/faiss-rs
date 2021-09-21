@@ -17,7 +17,7 @@ use crate::selector::IdSelector;
 use std::ffi::CString;
 use std::fmt::{self, Display, Formatter, Write};
 use std::os::raw::c_uint;
-use std::ptr;
+use std::{mem, ptr};
 
 use faiss_sys::*;
 
@@ -27,6 +27,9 @@ pub mod id_map;
 pub mod io;
 pub mod ivf_flat;
 pub mod lsh;
+pub mod pretransform;
+pub mod refine_flat;
+pub mod scalar_quantizer;
 
 #[cfg(feature = "gpu")]
 pub mod gpu;
@@ -175,12 +178,85 @@ pub trait Index {
 
     /// Remove data vectors represented by IDs.
     fn remove_ids(&mut self, sel: &IdSelector) -> Result<usize>;
+
+    /// Index verbosity level
+    fn verbose(&self) -> bool;
+
+    /// Set Index verbosity level
+    fn set_verbose(&mut self, value: bool);
+}
+
+impl<I> Index for Box<I>
+where
+    I: Index,
+{
+    fn is_trained(&self) -> bool {
+        (**self).is_trained()
+    }
+
+    fn ntotal(&self) -> u64 {
+        (**self).ntotal()
+    }
+
+    fn d(&self) -> u32 {
+        (**self).d()
+    }
+
+    fn metric_type(&self) -> MetricType {
+        (**self).metric_type()
+    }
+
+    fn add(&mut self, x: &[f32]) -> Result<()> {
+        (**self).add(x)
+    }
+
+    fn add_with_ids(&mut self, x: &[f32], xids: &[Idx]) -> Result<()> {
+        (**self).add_with_ids(x, xids)
+    }
+
+    fn train(&mut self, x: &[f32]) -> Result<()> {
+        (**self).train(x)
+    }
+
+    fn assign(&mut self, q: &[f32], k: usize) -> Result<AssignSearchResult> {
+        (**self).assign(q, k)
+    }
+
+    fn search(&mut self, q: &[f32], k: usize) -> Result<SearchResult> {
+        (**self).search(q, k)
+    }
+
+    fn range_search(&mut self, q: &[f32], radius: f32) -> Result<RangeSearchResult> {
+        (**self).range_search(q, radius)
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        (**self).reset()
+    }
+
+    fn remove_ids(&mut self, sel: &IdSelector) -> Result<usize> {
+        (**self).remove_ids(sel)
+    }
+
+    fn verbose(&self) -> bool {
+        (**self).verbose()
+    }
+
+    fn set_verbose(&mut self, value: bool) {
+        (**self).set_verbose(value)
+    }
 }
 
 /// Sub-trait for native implementations of a Faiss index.
 pub trait NativeIndex: Index {
     /// Retrieve a pointer to the native index object.
     fn inner_ptr(&self) -> *mut FaissIndex;
+}
+
+impl<NI: NativeIndex> NativeIndex for Box<NI> {
+    fn inner_ptr(&self) -> *mut FaissIndex {
+        (**self).inner_ptr()
+    }
 }
 
 /// Trait for a Faiss index that can be safely searched over multiple threads.
@@ -203,8 +279,24 @@ pub trait ConcurrentIndex: Index {
     fn range_search(&self, q: &[f32], radius: f32) -> Result<RangeSearchResult>;
 }
 
+impl<CI: ConcurrentIndex> ConcurrentIndex for Box<CI> {
+    fn assign(&self, q: &[f32], k: usize) -> Result<AssignSearchResult> {
+        (**self).assign(q, k)
+    }
+
+    fn search(&self, q: &[f32], k: usize) -> Result<SearchResult> {
+        (**self).search(q, k)
+    }
+
+    fn range_search(&self, q: &[f32], radius: f32) -> Result<RangeSearchResult> {
+        (**self).range_search(q, radius)
+    }
+}
+
 /// Trait for Faiss index types known to be running on the CPU.
 pub trait CpuIndex: Index {}
+
+impl<CI: CpuIndex> CpuIndex for Box<CI> {}
 
 /// Trait for Faiss index types which can be built from a pointer
 /// to a native implementation.
@@ -218,8 +310,16 @@ pub trait FromInnerPtr: NativeIndex {
     /// compatible with the target `NativeIndex` type according to the native
     /// class hierarchy. For example, creating an `IndexImpl` out of a pointer
     /// to `FaissIndexFlatL2` is valid, but creating a `FlatIndex` out of a
-    /// plain `FaissIndex` can cause undefined behaviour.
+    /// plain `FaissIndex` can cause undefined behavior.
     unsafe fn from_inner_ptr(inner_ptr: *mut FaissIndex) -> Self;
+}
+
+/// Trait for Faiss index types which can be built from a pointer
+/// to a native implementation.
+pub trait TryFromInnerPtr: NativeIndex {
+    fn try_from_inner_ptr(inner_ptr: *mut FaissIndex) -> Result<Self>
+    where
+        Self: Sized;
 }
 
 /// The outcome of an index assign operation.
@@ -354,6 +454,49 @@ impl FromInnerPtr for IndexImpl {
     }
 }
 
+impl TryFromInnerPtr for IndexImpl {
+    fn try_from_inner_ptr(inner_ptr: *mut FaissIndex) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        if inner_ptr.is_null() {
+            Err(Error::BadCast)
+        } else {
+            Ok(IndexImpl { inner: inner_ptr })
+        }
+    }
+}
+
+/// Index upcast trait.
+/// 
+/// If you need to store several different types of indexes in one collection,
+/// you can cast all indexes to the common type `IndexImpl`.
+/// # Examples
+///
+/// ```
+/// # use faiss::{index::{IndexImpl, UpcastIndex}, FlatIndex, index_factory, MetricType};
+/// let f1 = FlatIndex::new_l2(128).unwrap();
+/// let f2 = index_factory(128, "Flat", MetricType::L2).unwrap();
+/// let v: Vec<IndexImpl> = vec![
+///     f1.upcast(),
+///     f2,
+/// ];
+/// ```
+///
+pub trait UpcastIndex: NativeIndex {
+    /// Convert an index to the base `IndexImpl` type
+    fn upcast(self) -> IndexImpl;
+}
+
+impl<NI: NativeIndex> UpcastIndex for NI {
+    fn upcast(self) -> IndexImpl {
+        let inner_ptr = self.inner_ptr();
+        mem::forget(self);
+
+        unsafe { IndexImpl::from_inner_ptr(inner_ptr) }
+    }
+}
+
 impl_native_index!(IndexImpl);
 
 impl_native_index_clone!(IndexImpl);
@@ -395,6 +538,14 @@ mod tests {
         let index = index_factory(64, "Flat", MetricType::L2).unwrap();
         assert_eq!(index.is_trained(), true); // Flat index does not need training
         assert_eq!(index.ntotal(), 0);
+    }
+
+    #[test]
+    fn index_factory_flat_boxed() {
+        let index = index_factory(64, "Flat", MetricType::L2).unwrap();
+        let boxed = Box::new(index);
+        assert_eq!(boxed.is_trained(), true); // Flat index does not need training
+        assert_eq!(boxed.ntotal(), 0);
     }
 
     #[test]
